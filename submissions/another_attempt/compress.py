@@ -56,6 +56,7 @@ N_PAIRS_PER_FILE = 600
 COND_DIM = 48
 POSE_DIM = 6
 MASK_CRF = 55   # max AV1 quantization; mask is lossy but generator is trained on the noisy roundtrip
+ORIG_VIDEO_BYTES = 37_545_489  # public test mkv size; used for the score-formula rate term
 
 
 class Stage(Enum):
@@ -75,7 +76,9 @@ class PipelineRun:
     ce_weight: float = 1.0
     pose_weight: float = 1.0
     warmup_epochs: int = 2
-    ema_decay: float = 0.99
+    # Lower decay → EMA tracks the QAT-quantized weights more tightly.
+    # 0.99 caused a ~100-epoch lag between training optimum and saved EMA.
+    ema_decay: float = 0.95
     grad_clip: float = 1.0
     frame1_seg_weight: float = 0.0
 
@@ -587,8 +590,10 @@ class JointFrameGenerator(nn.Module):
         self.shared_trunk = SharedMaskDecoder(num_classes, emb_dim=6, c1=56, c2=64, depth_mult=depth_mult)
         self.pose_mlp = nn.Sequential(
             nn.Linear(pose_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
-        self.frame1_head = FrameHead(in_ch=56, cond_dim=cond_dim, hidden=52, depth_mult=depth_mult)
-        self.frame2_head = Frame2StaticHead(in_ch=56, hidden=52, depth_mult=depth_mult)
+        # Heads use depth_mult=2 (vs trunk depth_mult=1) — heads produce pixels and
+        # need more capacity to overcome FP4 quant noise; +~20K params, +~10KB at FP4.
+        self.frame1_head = FrameHead(in_ch=56, cond_dim=cond_dim, hidden=52, depth_mult=2)
+        self.frame2_head = Frame2StaticHead(in_ch=56, hidden=52, depth_mult=2)
 
     def set_qat(self, enabled):
         for m in self.modules():
@@ -780,12 +785,13 @@ def train_run(run, generator, loader, device, archive_dir, aux_models, state_dic
             mask_sz   = (archive_dir / "mask.obu.br").stat().st_size if (archive_dir / "mask.obu.br").exists() else 0
             pose_sz   = (archive_dir / "pose.bin.br").stat().st_size if (archive_dir / "pose.bin.br").exists() else 0
             total_bytes = model_sz + mask_sz + pose_sz
-            total_pixels = n_samples * 2 * OUT_W * OUT_H
-            rate_bpp = (total_bytes * 8.0) / max(1, total_pixels)
+            # Rate matches the official scorer: archive_bytes / source_video_bytes.
+            # (Earlier the eval used bits-per-pixel here, which under-counts by ~4x.)
+            rate = total_bytes / max(1, ORIG_VIDEO_BYTES)
 
             scaled_seg  = 100.0 * avg_seg
             scaled_pose = math.sqrt(max(0, 10.0 * avg_pose))
-            scaled_rate = 25.0 * rate_bpp
+            scaled_rate = 25.0 * rate
             eval_metric = scaled_seg + scaled_pose + scaled_rate
             logging.info(f"  [Eval] Score~{eval_metric:.4f} | "
                          f"Seg={scaled_seg:.4f} Pose={scaled_pose:.4f} Rate={scaled_rate:.4f}")
@@ -880,13 +886,14 @@ def main():
                               args.batch_size, device)
     generator = JointFrameGenerator().to(device)
 
+    # 3-stage pipeline (was 5). Heads now have depth_mult=2 so each epoch is ~50% slower;
+    # collapsing the redundant boost/joint passes saves ~6h while keeping the
+    # frame2-anchor → frame1+pose-finetune → micro-polish backbone intact.
     PIPELINE = [
-        PipelineRun("run1_anchor",  Stage.ANCHOR,   400, 5e-4, qat_start_epoch=150, frame1_fade_epochs=60,  error_boost=9.0),
-        PipelineRun("run2_boost",   Stage.ANCHOR,    80, 1e-5, qat_start_epoch=0,   frame1_fade_epochs=0,   error_boost=49.0),
-        PipelineRun("run3_finetune",Stage.FINETUNE, 320, 5e-5, qat_start_epoch=100, frame1_fade_epochs=60,  pose_weight=1.0,
+        PipelineRun("run1_anchor",  Stage.ANCHOR,   320, 5e-4, qat_start_epoch=120, frame1_fade_epochs=60,  error_boost=9.0),
+        PipelineRun("run2_finetune",Stage.FINETUNE, 280, 5e-5, qat_start_epoch=80,  frame1_fade_epochs=60,  pose_weight=1.0,
                     frame1_seg_weight=0.3),
-        PipelineRun("run4_joint",   Stage.JOINT,    160, 1e-5, qat_start_epoch=0,   frame1_fade_epochs=40,  pose_weight=1.0),
-        PipelineRun("run5_micro",   Stage.FINETUNE, 120, 5e-6, qat_start_epoch=0,   frame1_fade_epochs=0,   pose_weight=1.0,
+        PipelineRun("run3_joint",   Stage.JOINT,    180, 1e-5, qat_start_epoch=0,   frame1_fade_epochs=40,  pose_weight=1.0,
                     frame1_seg_weight=0.3),
     ]
 
