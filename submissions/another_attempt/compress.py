@@ -587,13 +587,11 @@ class Frame2StaticHead(nn.Module):
 class JointFrameGenerator(nn.Module):
     def __init__(self, num_classes=5, pose_dim=POSE_DIM, cond_dim=COND_DIM, depth_mult=1):
         super().__init__()
-        # Wider trunk (c1=72, c2=88) — the trunk sees the noisy mask and is the
-        # capacity floor for seg distortion. Heads stay at depth_mult=1.
-        self.shared_trunk = SharedMaskDecoder(num_classes, emb_dim=6, c1=72, c2=88, depth_mult=depth_mult)
+        self.shared_trunk = SharedMaskDecoder(num_classes, emb_dim=6, c1=56, c2=64, depth_mult=depth_mult)
         self.pose_mlp = nn.Sequential(
             nn.Linear(pose_dim, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
-        self.frame1_head = FrameHead(in_ch=72, cond_dim=cond_dim, hidden=52, depth_mult=depth_mult)
-        self.frame2_head = Frame2StaticHead(in_ch=72, hidden=52, depth_mult=depth_mult)
+        self.frame1_head = FrameHead(in_ch=56, cond_dim=cond_dim, hidden=52, depth_mult=depth_mult)
+        self.frame2_head = Frame2StaticHead(in_ch=56, hidden=52, depth_mult=depth_mult)
 
     def set_qat(self, enabled):
         for m in self.modules():
@@ -886,14 +884,18 @@ def main():
                               args.batch_size, device)
     generator = JointFrameGenerator().to(device)
 
-    # 3-stage pipeline (was 5). Heads now have depth_mult=2 so each epoch is ~50% slower;
-    # collapsing the redundant boost/joint passes saves ~6h while keeping the
-    # frame2-anchor → frame1+pose-finetune → micro-polish backbone intact.
+    # 3-stage backbone + 2 manual-restart refines (the creator's actual recipe).
+    # Each refine reloads the previous best, halves LR, and re-runs the joint
+    # stage with shorter epochs to crawl out of plateaus.
     PIPELINE = [
         PipelineRun("run1_anchor",  Stage.ANCHOR,   320, 5e-4, qat_start_epoch=120, frame1_fade_epochs=60,  error_boost=9.0),
         PipelineRun("run2_finetune",Stage.FINETUNE, 280, 5e-5, qat_start_epoch=80,  frame1_fade_epochs=60,  pose_weight=1.0,
                     frame1_seg_weight=0.3),
         PipelineRun("run3_joint",   Stage.JOINT,    180, 1e-5, qat_start_epoch=0,   frame1_fade_epochs=40,  pose_weight=1.0,
+                    frame1_seg_weight=0.3),
+        PipelineRun("run4_refine",  Stage.JOINT,    120, 5e-6, qat_start_epoch=0,   frame1_fade_epochs=0,   pose_weight=1.0,
+                    frame1_seg_weight=0.3),
+        PipelineRun("run5_refine",  Stage.JOINT,     80, 2.5e-6, qat_start_epoch=0, frame1_fade_epochs=0,   pose_weight=1.0,
                     frame1_seg_weight=0.3),
     ]
 
