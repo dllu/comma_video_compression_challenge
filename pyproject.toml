@@ -15,7 +15,6 @@ dependencies = [
   "requests",
   "urllib3",
   "brotli",
-  "opencv-python>=4.13.0.92",
 ]
 
 [dependency-groups]
